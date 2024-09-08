@@ -13,9 +13,10 @@
 #define WOTS_L1 (256 / 4)
 #define WOTS_L2 3
 #define WOTS_L (WOTS_L1 + WOTS_L2)
+#define HORS_K 1
 
 #define TEST_SIGNATURES 16
-#define NUM_SECRET_KEYS 1048576
+#define NUM_SECRET_KEYS 1024
 #define HASH_LEN WOTS_N
 
 
@@ -24,12 +25,55 @@ void hash256(const unsigned char *data, size_t data_len, unsigned char *out) {
     SHA256(data, data_len, out);
 }
 
+// Generates a random private key
+void generate_private_key(unsigned char *private_key) {
+    RAND_bytes(private_key, HASH_LEN);
+}
+void generate_public_key(unsigned char *private_key, unsigned char *public_key) {
+    hash256(private_key, HASH_LEN, public_key);
+}
+
+// HORS key pair generation
+void generate_hors_keys(unsigned char private_keys[][HASH_LEN], unsigned char public_keys[][HASH_LEN]) {
+    for (int i = 0; i < NUM_SECRET_KEYS; i++) {
+        generate_private_key(private_keys[i]);
+        generate_public_key(private_keys[i], public_keys[i]);
+    }
+}
+
+// HORS signature
+void hors_sign(unsigned char private_keys[][HASH_LEN], unsigned char *message, unsigned char hors_signature[HORS_K][HASH_LEN], int key_indices[HORS_K]) {
+    unsigned char message_hash[HASH_LEN];
+    hash256(message, strlen((char *)message), message_hash);
+
+    for (int i = 0; i < HORS_K; i++) {
+        key_indices[i] = message_hash[i] % NUM_SECRET_KEYS;
+        memcpy(hors_signature[i], private_keys[key_indices[i]], HASH_LEN);
+    }
+}
+
+// HORS verification
+int hors_verify(unsigned char public_keys[][HASH_LEN], unsigned char *message, unsigned char hors_signature[HORS_K][HASH_LEN], int key_indices[HORS_K]) {
+    unsigned char message_hash[HASH_LEN];
+    unsigned char expected_public_key[HASH_LEN];
+
+    hash256(message, strlen((char *)message), message_hash);
+
+    for (int i = 0; i < HORS_K; i++) {
+        hash256(hors_signature[i], HASH_LEN, expected_public_key);
+        if (memcmp(expected_public_key, public_keys[key_indices[i]], HASH_LEN) != 0) {
+            return 0; // False
+        }
+    }
+    return 1; // True
+}
+
 // Function to apply the chain operation using HMAC-SHA-256
 void chain(unsigned char *out, int start, int steps, unsigned char *bitmask, size_t bitmask_len) {
     unsigned char new_val[WOTS_N];
     unsigned char tohash[WOTS_N];
     for (int i = start; i < steps; i++) {
-        HMAC(EVP_SHA256(), bitmask, bitmask_len, out, WOTS_N, new_val, NULL);
+        HMAC(EVP_sha256(), bitmask, bitmask_len, out, WOTS_N, new_val, NULL);
         // Perform XOR between `out` and `new_val`
         for (int j = 0; j < WOTS_N; j++) {
             tohash[j] = out[j] ^ new_val[j];
@@ -283,6 +327,7 @@ unsigned char*** build_merkle_tree(char **secret_keys, int leavesCount) {
     return hashArray;
 }
 
+
 unsigned char*** build_xmss_tree(WOTS_KeyPair* wots_keys, int number_of_keys, const unsigned char *bitmask) {
     unsigned char l_tree_root[WOTS_N];
     char **hex_l_tree_roots = malloc(number_of_keys * sizeof(char *));
@@ -316,6 +361,8 @@ typedef struct {
 } ProofNode;
 
 typedef struct {
+    unsigned char hors_signature[HORS_K][HASH_LEN];
+    int hors_key_indices[HORS_K];
     // WOTS+ signature
     unsigned char wots_signature[WOTS_L][WOTS_N];
     // Authentication path (simplified)
@@ -370,7 +417,7 @@ void concatenate_and_hash(const unsigned char* hash1, const unsigned char* hash2
 
 
 // Sign a message with XMSS
-XMSS_Signature xmss_sign(unsigned char *message, WOTS_KeyPair *wots_keys, unsigned char ***xmss_tree, int number_of_keys, unsigned char *bitmask) {
+XMSS_Signature xmss_sign(unsigned char *message, WOTS_KeyPair *wots_keys, unsigned char ***xmss_tree, int number_of_keys, unsigned char *bitmask, unsigned char hors_private_keys[][HASH_LEN]) {
     XMSS_Signature xmss_signature;
     // Calculate total levels in the XMSS tree
     int levels = 1;
@@ -381,25 +428,33 @@ XMSS_Signature xmss_sign(unsigned char *message, WOTS_KeyPair *wots_keys, unsign
     }
     int path_length = 0;
 
-    // Step 1: Sign the message using the selected WOTS+ private key
-    unsigned char message_hash[HASH_LEN];
-    hash256((unsigned char *)message, strlen((char *)message), message_hash);
+    // Step 1: Sign the message using the HORS private keys
+    hors_sign(hors_private_keys, message, xmss_signature.hors_signature, xmss_signature.hors_key_indices);
 
-    // printf("Secret key size: %lu bytes \n", sizeof(wots_keys[leaf_index]));
-    int leaf_index = message_hash[0] % NUM_SECRET_KEYS;
+    // Step 2: Compute the HORS public key from the signature and message hash
+    unsigned char hors_message_hash[HASH_LEN];
+    hash256(message, strlen((char *)message), hors_message_hash);
+    unsigned char hors_public_key[HASH_LEN];
+    // Concatenate HORS public key parts
+    for (int i = 0; i < HORS_K; i++) {
+        hash256(xmss_signature.hors_signature[i], HASH_LEN, hors_public_key + (i * HASH_LEN / HORS_K));
+    }
 
-    size_t private_key_size = sizeof(wots_keys[leaf_index].private_key);
+    // Step 3: Sign the HORS public key using WOTS+
+    unsigned char wots_message_hash[HASH_LEN];
+    hash256(hors_public_key, HASH_LEN, wots_message_hash);
 
-    // wots_sign(xmss_signature.wots_signature, message_hash, wots_keys[leaf_index].private_key, bitmask, private_key_size);
-    wots_sign(xmss_signature.wots_signature, message, strlen((char *)message), wots_keys[leaf_index].private_key, bitmask, sizeof(bitmask));
-    // Step 2: Generate prrof path
+    int leaf_index = 1; // This should be based on your logic
+    wots_sign(xmss_signature.wots_signature, wots_message_hash, HASH_LEN, wots_keys[leaf_index].private_key, bitmask, WOTS_N);
+
+    // Step 4: Generate the authentication path
     xmss_signature.authentication_path = generate_proof_path_with_direction(xmss_tree, levels, leaf_index, &path_length);
-    // Step 3: Set the leaf index and path length in the signature
     xmss_signature.path_length = path_length;
     xmss_signature.leaf_index = leaf_index;
 
     return xmss_signature;
 }
+
 
 // Verify the signature
 int verify_signature(const unsigned char* message_hash, ProofNode* proof_path, int path_length, const unsigned char* merkle_root, const unsigned char* secret_key) {
@@ -422,17 +477,32 @@ int verify_signature(const unsigned char* message_hash, ProofNode* proof_path, i
 }
 
 // Verification of XMSS signature
-int xmss_verify(unsigned char *message, WOTS_KeyPair *wots_keys, int number_of_keys, const unsigned char *root, XMSS_Signature *signature,  unsigned char *bitmask) {
+int xmss_verify(unsigned char *message, WOTS_KeyPair *wots_keys, int number_of_keys, const unsigned char *root, XMSS_Signature *signature, unsigned char *bitmask, unsigned char hors_public_keys[][HASH_LEN]) {
 
-    // Step 1: Recompute the WOTS+ public key from the signature and message
-    unsigned char recompute_pubkey[WOTS_L][WOTS_N];
-    if (!wots_verify(signature->wots_signature, message, strlen((char *)message), wots_keys[signature->leaf_index].public_key, bitmask, sizeof(bitmask))) {
+    // Step 1: Verify the HORS signature
+    if (!hors_verify(hors_public_keys, message, signature->hors_signature, signature->hors_key_indices)) {
+        printf("HORS verification failed.\n");
+        return 0;
+    }
+
+    // Step 2: Compute the HORS public key from the signature and message hash
+    unsigned char hors_message_hash[HASH_LEN];
+    hash256(message, strlen((char *)message), hors_message_hash);
+    unsigned char hors_public_key[HASH_LEN];
+    for (int i = 0; i < HORS_K; i++) {
+        hash256(signature->hors_signature[i], HASH_LEN, hors_public_key + (i * HASH_LEN / HORS_K));
+    }
+
+    // Step 3: Verify the WOTS+ signature using the HORS public key
+    unsigned char wots_message_hash[HASH_LEN];
+    hash256(hors_public_key, HASH_LEN, wots_message_hash);
+
+    if (!wots_verify(signature->wots_signature, wots_message_hash, HASH_LEN, wots_keys[signature->leaf_index].public_key, bitmask, WOTS_N)) {
         printf("WOTS+ verification failed.\n");
         return 0;
     }
 
-    unsigned char message_hash[HASH_LEN];
-    hash256((const unsigned char *)message, strlen((const char *)message), message_hash);
+    // Step 4: Verify the authentication path
     unsigned char l_tree_root[WOTS_N];
     l_tree(wots_keys[signature->leaf_index].public_key, l_tree_root, bitmask);
     char l_tree_root_hex[HASH_LEN * 2 + 1];
@@ -440,16 +510,20 @@ int xmss_verify(unsigned char *message, WOTS_KeyPair *wots_keys, int number_of_k
 
     unsigned char secret_key_binary[HASH_LEN];
     hex_string_to_binary(l_tree_root_hex, secret_key_binary, HASH_LEN);
-    // Now verify the signature with correct parameters
-    int signature_valid = verify_signature(message_hash, signature->authentication_path,  signature->path_length, root, secret_key_binary);
+
+    unsigned char message_hash[HASH_LEN];
+    hash256((const unsigned char *)message, strlen((const char *)message), message_hash);
+
+    int signature_valid = verify_signature(message_hash, signature->authentication_path, signature->path_length, root, secret_key_binary);
     if (signature_valid == 1) {
-        // printf("XMSS verification successful.\n");
+        // printf("XMSS verified.\n");
         return 1;
     } else {
         printf("XMSS verification failed.\n");
         return 0;
     }
 }
+
 
 static unsigned long long get_cpu_cycles(void)
 {
@@ -516,7 +590,11 @@ int main() {
     }
     WOTS_KeyPair* wots_keys = generate_wots_keys(number_of_keys, bitmask);
 
-    unsigned char*** xmss_tree = build_xmss_tree(wots_keys, number_of_keys,bitmask);
+    unsigned char hors_private_keys[NUM_SECRET_KEYS][HASH_LEN];
+    unsigned char hors_public_keys[NUM_SECRET_KEYS][HASH_LEN];
+    generate_hors_keys(hors_private_keys, hors_public_keys);
+
+    unsigned char*** xmss_tree = build_xmss_tree(wots_keys, number_of_keys, bitmask);
 
     t1 = get_cpu_cycles();
     clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &stop);
@@ -531,43 +609,33 @@ int main() {
     XMSS_Signature signaturXmss[TEST_SIGNATURES];
     printf("Creating %d signatures..\n", TEST_SIGNATURES);
     for (int i = 0; i < TEST_SIGNATURES; i++) {
-        // random_index = rand() % NUM_SECRET_KEYS;
         t[i] = get_cpu_cycles();
-        signaturXmss[i] = xmss_sign(message, wots_keys, xmss_tree, number_of_keys, bitmask);
+        signaturXmss[i] = xmss_sign(message, wots_keys, xmss_tree, number_of_keys, bitmask, hors_private_keys);
     }
     display_results(t, TEST_SIGNATURES);
     printf("Verifying %d signatures..\n", TEST_SIGNATURES);
 
     for (int i = 0; i < TEST_SIGNATURES; i++) {
         t[i] = get_cpu_cycles();
-        int verification_result = xmss_verify(message,wots_keys, number_of_keys, root, &signaturXmss[i], bitmask);
+        int verification_result = xmss_verify(message, wots_keys, number_of_keys, root, &signaturXmss[i], bitmask, hors_public_keys);
         // printf("Verification result: %s\n", verification_result ? "PASS" : "FAIL");
     }
     display_results(t, TEST_SIGNATURES);
 
-
     char root_hex[HASH_LEN * 2 + 1];
     bytes_to_hex(root, WOTS_N, root_hex);
     printf("root %s \n", root_hex);
-    printf("Public key size: %lu bytes \n", sizeof(root));
-
-    printf("Signature size: %lu bytes \n", sizeof(signaturXmss[0]) + sizeof(root) + sizeof(wots_keys[signaturXmss[0].leaf_index].public_key) + sizeof(wots_keys[signaturXmss[0].leaf_index].private_key));
-    printf("Signature size: %lu bytes \n", sizeof(signaturXmss[0]));
-
-    // individual size:
-    size_t size_of_one_secret_key = WOTS_L * WOTS_N;
-    printf("Size of secret key: %zu bytes\n", size_of_one_secret_key);
-
 
     struct task_basic_info t_info;
     mach_msg_type_number_t t_info_count = TASK_BASIC_INFO_COUNT;
 
     if (KERN_SUCCESS != task_info(mach_task_self(),
-                                TASK_BASIC_INFO, (task_info_t)&t_info,
-                                &t_info_count))
+                                  TASK_BASIC_INFO, (task_info_t)&t_info,
+                                  &t_info_count))
     {
         return -1;
     }
+
     // Free allocated memory for the XMSS tree
     for (int i = 0; i < levels; ++i) {
         int levelCount = (number_of_keys + (1 << i) - 1) / (1 << i);
@@ -580,4 +648,5 @@ int main() {
 
     return 0;
 }
+
 
