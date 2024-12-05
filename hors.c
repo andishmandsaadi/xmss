@@ -1,109 +1,64 @@
-#include <stdio.h>
-#include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
-#include <openssl/sha.h>
-#include <openssl/rand.h>
-#include <mach/mach.h>
 
-#define KEY_SIZE 1
-#define HASH_LEN 32
+#include "utils.h"
+#include "hash.h"
+#include "hors.h"
+#include "hash_address.h"
+#include "params.h"
+#include <unistd.h>
 
-clock_t start, end;
-double cpu_time_used;
 
-// Generates a random private key
-void generate_private_key(unsigned char *private_key) {
-    RAND_bytes(private_key, HASH_LEN);
-}
+/**
+ * HORS key generation. Takes a 32 byte seed for the private key, expands it to
+ * a full HORS private key and computes the corresponding public key.
+ * It requires the seed pub_seed (used to generate bitmasks and hash keys)
+ * and the address of this HORS key pair.
+ *
+ * Writes the computed public key to 'pk'.
+ */
+void gen_hors(const xmss_params *params,
+                const unsigned char *pk, const unsigned char *sk,
+                const unsigned char *pub_seed, uint32_t addr[9])
+{
+    uint32_t i;
 
-void hash256(const unsigned char *input, size_t len, unsigned char output[HASH_LEN]) {
-    SHA256(input, len, output);
-}
-
-// Computes the SHA-256 hash of the private key to generate the public key
-void generate_public_key(unsigned char *private_key, unsigned char *public_key) {
-    hash256(private_key, HASH_LEN, public_key);
-}
-
-// Signs a message using a private key selected based on the hash of the message
-void sign(unsigned char private_keys[][HASH_LEN], unsigned char *message, size_t message_len, unsigned char *signature, int *key_index) {
-    unsigned char message_hash[HASH_LEN];
-
-    hash256(message, HASH_LEN, message_hash);
-
-    // Simplified selection of a single key based on the first byte of the hash
-    *key_index = message_hash[0] % KEY_SIZE;
-    memcpy(signature, private_keys[*key_index], HASH_LEN);
-}
-
-// Verifies the signature of a message
-int verify(unsigned char public_keys[][HASH_LEN], unsigned char *message, size_t message_len, unsigned char *signature, int key_index) {
-    unsigned char message_hash[HASH_LEN];
-    unsigned char expected_public_key[HASH_LEN];
-
-    // Hash the message
-    hash256(message, HASH_LEN, message_hash);
-
-    // Compute expected public key from the signature
-    hash256(signature, HASH_LEN, expected_public_key);
-
-    // Compare the expected public key with the actual public key
-    return memcmp(expected_public_key, public_keys[key_index], HASH_LEN) == 0;
-}
-
-int main() {
-    printf("SHA256\n");
-    start = clock();
-    unsigned char private_keys[KEY_SIZE][HASH_LEN];
-    unsigned char public_keys[KEY_SIZE][HASH_LEN];
-    unsigned char signature[HASH_LEN];
-    int key_index;
-
-    // Generate key pairs
-    for (int i = 0; i < KEY_SIZE; i++) {
-        generate_private_key(private_keys[i]);
-        generate_public_key(private_keys[i], public_keys[i]);
+    for (i = 0; i < params->wots_len; i++) {
+        set_chain_addr(addr, i);
+        hors_hash(params, pk, sk, params->padding_len + params->n + 32);
     }
-    end = clock();
+}
 
-    cpu_time_used = ((double) (end - start)) / CLOCKS_PER_SEC;
-    printf("Key generation took %f seconds to execute \n", cpu_time_used);
-    printf("Key size: %lu bytes\n", sizeof(private_keys)); // For private or public key size
+/**
+ * Takes a n-byte message and the 32-byte seed for the private key to compute a
+ * signature that is placed at 'sig'.
+ */
+void hors_sign(const xmss_params *params,
+               unsigned char *sig, const unsigned char *msg,
+               const unsigned char *seed, const unsigned char *pub_seed,
+               uint32_t addr[9])
+{
+    uint32_t i;
 
-    // Example message
-    unsigned char message[] = "Hello, World!";
-    size_t message_len = strlen((char *)message);
-
-    // Sign the message
-    start = clock();
-    sign(private_keys, message, message_len, signature, &key_index);
-    end = clock();
-    cpu_time_used = ((double) (end - start)) / CLOCKS_PER_SEC;
-    printf("Signature took %f seconds to execute \n", cpu_time_used);
-    printf("Signature size: %lu bytes\n", sizeof(signature));
-
-    // Verify the signature
-    start = clock();
-    if (verify(public_keys, message, message_len, signature, key_index)) {
-        printf("Signature verified successfully.\n");
-    } else {
-        printf("Signature verification failed.\n");
+    for (i = 0; i < params->wots_len; i++) {
+        set_chain_addr(addr, i);
+        hors_hash(params, pub_seed, seed, params->padding_len + params->n + 32);
     }
-    end = clock();
-    cpu_time_used = ((double) (end - start)) / CLOCKS_PER_SEC;
-    printf("Signature Verify took %f seconds to execute \n", cpu_time_used);
+}
 
-    struct task_basic_info t_info;
-    mach_msg_type_number_t t_info_count = TASK_BASIC_INFO_COUNT;
+/**
+ * Takes a HORS signature and an n-byte message, computes a HORS public key.
+ *
+ * Writes the computed public key to 'pk'.
+ */
+void hors_pk_from_sig(const xmss_params *params, unsigned char *pk,
+                      const unsigned char *sig, const unsigned char *msg,
+                      const unsigned char *pub_seed, uint32_t addr[9])
+{
+    uint32_t i;
 
-    if (KERN_SUCCESS != task_info(mach_task_self(),
-                                TASK_BASIC_INFO, (task_info_t)&t_info,
-                                &t_info_count))
-    {
-        return -1;
+    for (i = 0; i < params->wots_len; i++) {
+        set_chain_addr(addr, i);
+        hors_hash(params, pub_seed, pk, params->padding_len + params->n + 32);
     }
-    printf("Memory used: %lu bytes (%.2f MB)\n", t_info.resident_size, t_info.resident_size / 1024.0 / 1024.0);
-
-
-    return 0;
 }

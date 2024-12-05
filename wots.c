@@ -1,102 +1,181 @@
-#include <openssl/sha.h>
-#include <stdio.h>
-#include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
-#include <openssl/rand.h>
-#include <mach/mach.h>
 
-#define WOTS_N 32 // Length of hash output (SHA-256)
-#define WOTS_W 16 // Winternitz parameter
-#define WOTS_L ((256 + WOTS_W - 1) / WOTS_W) // Number of chains
+#include "utils.h"
+#include "hash.h"
+#include "wots.h"
+#include "hash_address.h"
+#include "params.h"
 
-clock_t start, end;
-double cpu_time_used;
+/**
+ * Helper method for pseudorandom key generation.
+ * Expands an n-byte array into a len*n byte array using the `prf_keygen` function.
+ */
+static void expand_seed(const xmss_params *params,
+                        unsigned char *outseeds, const unsigned char *inseed,
+                        const unsigned char *pub_seed, uint32_t addr[9])
+{
+    uint32_t i;
+    unsigned char buf[params->n + 32];
 
-void wots_hash(unsigned char *out, const unsigned char *in, size_t len) {
-    SHA256(in, len, out);
-}
-
-void wots_gen_chain(unsigned char *out, const unsigned char *seed, unsigned int chainlen) {
-    memcpy(out, seed, WOTS_N);
-    for (unsigned int i = 0; i < chainlen; ++i) {
-        wots_hash(out, out, WOTS_N);
+    set_hash_addr(addr, 0);
+    set_key_and_mask(addr, 0);
+    memcpy(buf, pub_seed, params->n);
+    for (i = 0; i < params->wots_len; i++) {
+        set_chain_addr(addr, i);
+        addr_to_bytes(buf + params->n, addr);
+        prf_keygen(params, outseeds + i*params->n, buf, inseed);
     }
 }
 
-void wots_gen_keypair(unsigned char public_key[WOTS_L][WOTS_N], unsigned char private_key[WOTS_L][WOTS_N]) {
-    for (int i = 0; i < WOTS_L; ++i) {
-        // In a real implementation, this should be a cryptographic random number
-        for (int j = 0; j < WOTS_N; ++j) {
-            private_key[i][j] = rand() % 256;
+/**
+ * Computes the chaining function.
+ * out and in have to be n-byte arrays.
+ *
+ * Interprets in as start-th value of the chain.
+ * addr has to contain the address of the chain.
+ */
+static void gen_chain(const xmss_params *params,
+                      unsigned char *out, const unsigned char *in,
+                      unsigned int start, unsigned int steps,
+                      const unsigned char *pub_seed, uint32_t addr[9])
+{
+    uint32_t i;
+
+    /* Initialize out with the value at position 'start'. */
+    memcpy(out, in, params->n);
+
+    /* Iterate 'steps' calls to the hash function. */
+    for (i = start; i < (start+steps) && i < params->wots_w; i++) {
+        set_hash_addr(addr, i);
+        thash_f(params, out, out, pub_seed, addr);
+    }
+}
+
+/**
+ * base_w algorithm as described in draft.
+ * Interprets an array of bytes as integers in base w.
+ * This only works when log_w is a divisor of 8.
+ */
+static void base_w(const xmss_params *params,
+                   int *output, const int out_len, const unsigned char *input)
+{
+    int in = 0;
+    int out = 0;
+    unsigned char total;
+    int bits = 0;
+    int consumed;
+
+    for (consumed = 0; consumed < out_len; consumed++) {
+        if (bits == 0) {
+            total = input[in];
+            in++;
+            bits += 8;
         }
-        wots_gen_chain(public_key[i], private_key[i], WOTS_W - 1);
+        bits -= params->wots_log_w;
+        output[out] = (total >> bits) & (params->wots_w - 1);
+        out++;
     }
 }
 
-void wots_sign(unsigned char signature[WOTS_L][WOTS_N], const unsigned char *message, const unsigned char private_key[WOTS_L][WOTS_N]) {
-    unsigned char hash[WOTS_N];
-    wots_hash(hash, message, strlen((char *)message));
+/* Computes the WOTS+ checksum over a message (in base_w). */
+static void wots_checksum(const xmss_params *params,
+                          int *csum_base_w, const int *msg_base_w)
+{
+    int csum = 0;
+    unsigned char csum_bytes[(params->wots_len2 * params->wots_log_w + 7) / 8];
+    unsigned int i;
 
-    for (int i = 0; i < WOTS_L; ++i) {
-        unsigned int chainlen = (hash[i / 2] >> (4 * (i % 2))) & (WOTS_W - 1);
-        wots_gen_chain(signature[i], private_key[i], chainlen);
+    /* Compute checksum. */
+    for (i = 0; i < params->wots_len1; i++) {
+        csum += params->wots_w - 1 - msg_base_w[i];
+    }
+
+    /* Convert checksum to base_w. */
+    /* Make sure expected empty zero bits are the least significant bits. */
+    csum = csum << (8 - ((params->wots_len2 * params->wots_log_w) % 8));
+    ull_to_bytes(csum_bytes, sizeof(csum_bytes), csum);
+    base_w(params, csum_base_w, params->wots_len2, csum_bytes);
+}
+
+/* Takes a message and derives the matching chain lengths. */
+static void chain_lengths(const xmss_params *params,
+                          int *lengths, const unsigned char *msg)
+{
+    base_w(params, lengths, params->wots_len1, msg);
+    wots_checksum(params, lengths + params->wots_len1, lengths);
+}
+
+/**
+ * WOTS key generation. Takes a 32 byte seed for the private key, expands it to
+ * a full WOTS private key and computes the corresponding public key.
+ * It requires the seed pub_seed (used to generate bitmasks and hash keys)
+ * and the address of this WOTS key pair.
+ *
+ * Writes the computed public key to 'pk'.
+ */
+void wots_pkgen(const xmss_params *params,
+                unsigned char *pk, const unsigned char *seed,
+                const unsigned char *pub_seed, uint32_t addr[9])
+{
+    uint32_t i;
+
+    /* The WOTS+ private key is derived from the seed. */
+    // expand_seed(params, pk, seed, pub_seed, addr);
+
+    // Copy the seed into the public key (pk) as initial values
+    for (i = 0; i < params->wots_len; i++) {
+        memcpy(pk + i * params->n, seed, params->n);  // Initialize pk with seed values
+    }
+
+    for (i = 0; i < params->wots_len; i++) {
+        set_chain_addr(addr, i);
+        gen_chain(params, pk + i*params->n, pk + i*params->n,
+                  0, params->wots_w - 1, pub_seed, addr);
     }
 }
 
-int wots_verify(const unsigned char signature[WOTS_L][WOTS_N], const unsigned char *message, const unsigned char public_key[WOTS_L][WOTS_N]) {
-    unsigned char hash[WOTS_N];
-    wots_hash(hash, message, strlen((char *)message));
+/**
+ * Takes a n-byte message and the 32-byte seed for the private key to compute a
+ * signature that is placed at 'sig'.
+ */
+void wots_sign(const xmss_params *params,
+               unsigned char *sig, const unsigned char *msg,
+               const unsigned char *seed, const unsigned char *pub_seed,
+               uint32_t addr[9])
+{
+    int lengths[params->wots_len];
+    uint32_t i;
 
-    unsigned char verify[WOTS_N];
-    for (int i = 0; i < WOTS_L; ++i) {
-        unsigned int chainlen = WOTS_W - 1 - ((hash[i / 2] >> (4 * (i % 2))) & (WOTS_W - 1));
-        wots_gen_chain(verify, signature[i], chainlen);
-        if (memcmp(verify, public_key[i], WOTS_N) != 0) {
-            return 0; // Verification failed
-        }
+    chain_lengths(params, lengths, msg);
+
+    /* The WOTS+ private key is derived from the seed. */
+    expand_seed(params, sig, seed, pub_seed, addr);
+
+    for (i = 0; i < params->wots_len; i++) {
+        set_chain_addr(addr, i);
+        gen_chain(params, sig + i*params->n, sig + i*params->n,
+                  0, lengths[i], pub_seed, addr);
     }
-    return 1; // Verification succeeded
 }
 
-int main() {
-    printf("SHA256\n");
-    start = clock();
-    unsigned char public_key[WOTS_L][WOTS_N];
-    unsigned char private_key[WOTS_L][WOTS_N];
-    unsigned char signature[WOTS_L][WOTS_N];
+/**
+ * Takes a WOTS signature and an n-byte message, computes a WOTS public key.
+ *
+ * Writes the computed public key to 'pk'.
+ */
+void wots_pk_from_sig(const xmss_params *params, unsigned char *pk,
+                      const unsigned char *sig, const unsigned char *msg,
+                      const unsigned char *pub_seed, uint32_t addr[9])
+{
+    int lengths[params->wots_len];
+    uint32_t i;
 
-    wots_gen_keypair(public_key, private_key);
-    end = clock();
+    chain_lengths(params, lengths, msg);
 
-    cpu_time_used = ((double) (end - start)) / CLOCKS_PER_SEC;
-    printf("Key generation took %f seconds to execute \n", cpu_time_used);
-    printf("Key size: %lu bytes\n", sizeof(private_key)); // For private or public key size
-
-    start = clock();
-    char *message = "Test message";
-    wots_sign(signature, (unsigned char *)message, private_key);
-    end = clock();
-    cpu_time_used = ((double) (end - start)) / CLOCKS_PER_SEC;
-    printf("Signature took %f seconds to execute \n", cpu_time_used);
-    printf("Signature size: %lu bytes\n", sizeof(signature));
-
-    start = clock();
-    int valid = wots_verify(signature, (unsigned char *)message, public_key);
-    printf("Signature is %s\n", valid ? "valid" : "invalid");
-    end = clock();
-    cpu_time_used = ((double) (end - start)) / CLOCKS_PER_SEC;
-    printf("Signature Verify took %f seconds to execute \n", cpu_time_used);
-
-    struct task_basic_info t_info;
-    mach_msg_type_number_t t_info_count = TASK_BASIC_INFO_COUNT;
-
-    if (KERN_SUCCESS != task_info(mach_task_self(),
-                                TASK_BASIC_INFO, (task_info_t)&t_info,
-                                &t_info_count))
-    {
-        return -1;
+    for (i = 0; i < params->wots_len; i++) {
+        set_chain_addr(addr, i);
+        gen_chain(params, pk + i*params->n, sig + i*params->n,
+                  lengths[i], params->wots_w - 1 - lengths[i], pub_seed, addr);
     }
-    printf("Memory used: %lu bytes (%.2f MB)\n", t_info.resident_size, t_info.resident_size / 1024.0 / 1024.0);
-
-    return 0;
 }
